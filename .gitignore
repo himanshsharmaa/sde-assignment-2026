@@ -1,4 +1,8 @@
 runs/
+.pytest_cache/
 __pycache__/
 *.pyc
 .venv/
+.controller/
+*.sqlite3
+*.db

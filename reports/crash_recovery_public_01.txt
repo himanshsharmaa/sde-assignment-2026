@@ -1,0 +1,7 @@
+Crash/restart verification
+Scenario: public_01_dev
+Killed after simulated minute: 60
+Final simulated time: 2027-01-12T00:00:00+05:30
+Final event ID: 297035
+Controller wall-clock seconds (includes the interrupted first process): 64.46
+Result: scenario finished after restarting against the same SQLite database.
