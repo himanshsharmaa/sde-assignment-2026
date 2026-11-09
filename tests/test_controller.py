@@ -3,6 +3,7 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 import json
 import sqlite3
+import statistics
 import threading
 import time
 
@@ -17,6 +18,8 @@ from agentic_controller import (
     Store,
     _allocation_shift,
     _changed_dims,
+    _evaluate_experiment_look,
+    _planned_look_cutoff,
     _proportion_z,
     _sim_day,
 )
@@ -194,6 +197,22 @@ def _save_approved_proposal(store, payload, approval_id="approval-original"):
     )
 
 
+def _save_applied_exploration(store, proposal_id="proposal-exploration"):
+    payload = _proposal_payload(proposal_id)
+    payload["rationale"] = (
+        "Start two-arm voice exploration (V1, V2) for engagement_rate."
+    )
+    _save_approved_proposal(store, payload)
+    store.finalize_applied_proposal(
+        proposal_id,
+        "approval-original",
+        "2027-01-04T10:00:00+05:30",
+        "approval_applied",
+        {"proposal_id": proposal_id, "workflow_id": payload["workflow_id"]},
+    )
+    return payload
+
+
 def _call_event(event_id=1):
     return {
         "type": "call",
@@ -275,6 +294,170 @@ def test_config_diffs_and_total_variation_shift():
 def test_time_conversion_includes_history_days():
     assert _sim_day("2027-01-04T00:00:00+05:30") == 0
     assert _sim_day("2027-01-03T23:45:00+05:30") == -1
+
+
+@pytest.mark.parametrize(
+    ("advance_mode", "expected_advances"),
+    [("progress", 2), ("finish_without_clock_change", 1)],
+)
+def test_controller_run_exits_on_progress_or_simulator_completion(
+    tmp_path, advance_mode, expected_advances
+):
+    controller = Controller(
+        "http://simulator.test", str(tmp_path / "state.sqlite3")
+    )
+    api = _SimulatorLoopApi(advance_mode=advance_mode)
+    controller.client = api
+
+    asyncio.run(controller.run())
+
+    assert api.advance_calls == expected_advances
+    assert api.close_calls == 1
+
+
+def test_controller_run_fails_after_bounded_no_progress_advances(tmp_path):
+    controller = Controller(
+        "http://simulator.test", str(tmp_path / "state.sqlite3")
+    )
+    api = _SimulatorLoopApi(advance_mode="no_progress")
+    controller.client = api
+
+    with pytest.raises(RuntimeError, match="simulator made no progress"):
+        asyncio.run(controller.run())
+
+    assert api.advance_calls == 3
+    assert api.close_calls == 1
+
+
+def test_controller_run_rejects_backward_simulator_clock(tmp_path):
+    controller = Controller(
+        "http://simulator.test", str(tmp_path / "state.sqlite3")
+    )
+    api = _SimulatorLoopApi(advance_mode="backwards")
+    controller.client = api
+
+    with pytest.raises(RuntimeError, match="simulator clock moved backwards"):
+        asyncio.run(controller.run())
+
+    assert api.advance_calls == 1
+    assert api.close_calls == 1
+
+
+def test_controller_run_attempts_registration_before_evaluation_and_skips_safely(
+    tmp_path, caplog
+):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    _save_applied_exploration(store)
+    api = _SimulatorLoopApi(workflows=[{
+        "workflow_id": "wf",
+        "objective": {
+            "primary": "engagement_rate",
+            "guardrail": {"kpi": "pickup_rate"},
+        },
+    }])
+    api.state["finished"] = True
+    controller = Controller(
+        "http://simulator.test", str(store.path), store=store
+    )
+    controller.client = api
+    order = []
+    register = controller._register_eligible_experiment_plans
+    evaluate = controller._evaluate_registered_experiments
+
+    async def record_registration():
+        order.append("register")
+        await register()
+
+    async def record_evaluation(state):
+        order.append("evaluate")
+        await evaluate(state)
+
+    controller._register_eligible_experiment_plans = record_registration
+    controller._evaluate_registered_experiments = record_evaluation
+
+    asyncio.run(controller.run())
+
+    assert order == ["register", "evaluate", "register", "evaluate"]
+    assert store.experiments() == []
+    assert "Skipping fixed-horizon experiment registration" in caplog.text
+    assert "person-level baseline" in caplog.text
+    assert "sample targets" in caplog.text
+    assert "guardrail deterioration margin" in caplog.text
+    assert {path for method, path, _ in api.requests} <= {
+        "/sim/state",
+        "/workflows",
+        "/events/chunks",
+        "/approvals",
+    }
+    assert api.close_calls == 1
+
+
+def test_unapproved_or_ineligible_proposals_cannot_register_experiments(tmp_path, caplog):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    statuses = ("pending", "submitted", "approved", "deferred", "rejected")
+    for status in statuses:
+        payload = _proposal_payload(f"proposal-{status}")
+        payload["rationale"] = (
+            "Start two-arm voice exploration (V1, V2) for engagement_rate."
+        )
+        store.save_proposal(
+            payload["proposal_id"],
+            payload["workflow_id"],
+            payload["base_version"],
+            "approval",
+            status,
+            payload,
+        )
+    non_experiment = _proposal_payload("proposal-applied-remediation")
+    non_experiment["rationale"] = "Fix an observed incident."
+    store.save_proposal(
+        non_experiment["proposal_id"],
+        non_experiment["workflow_id"],
+        non_experiment["base_version"],
+        "approval",
+        "applied",
+        non_experiment,
+    )
+    controller = Controller(
+        "http://simulator.test", str(store.path), store=store
+    )
+
+    asyncio.run(controller._register_eligible_experiment_plans())
+
+    assert store.experiments() == []
+    assert "Skipping fixed-horizon experiment registration" not in caplog.text
+
+
+def test_registration_skip_does_not_change_existing_plan_or_look_progress(tmp_path):
+    db_path = str(tmp_path / "state.sqlite3")
+    store = Store(db_path)
+    payload = _save_applied_exploration(store)
+    _register_experiment(store, proposal_id=payload["proposal_id"])
+    assert store.set_experiment_look_cutoff("exp-1", 1, 120)
+    assert store.finalize_experiment_look(
+        "exp-1", 1, "continue", {"outcome": "continue"},
+        "2027-01-04T10:15:00+05:30",
+    )
+    before_experiments = store.experiments()
+    before_looks = store.experiment_looks("exp-1")
+
+    first_controller = Controller(
+        "http://simulator.test", db_path, store=store
+    )
+    asyncio.run(first_controller._register_eligible_experiment_plans())
+    asyncio.run(first_controller._register_eligible_experiment_plans())
+
+    restarted_store = Store(db_path)
+    restarted_controller = Controller(
+        "http://simulator.test", db_path, store=restarted_store
+    )
+    asyncio.run(restarted_controller._register_eligible_experiment_plans())
+
+    assert restarted_store.experiments() == before_experiments
+    assert restarted_store.experiment_looks("exp-1") == before_looks
+    assert restarted_store.experiments()[0]["status"] == "running"
+    assert restarted_store.experiment_looks("exp-1")[0]["cutoff_event_id"] == 120
+    assert len(restarted_store.experiments()) == 1
 
 
 def test_http_retry_is_bounded_and_post_can_disable_retry():
@@ -429,106 +612,12 @@ def test_submit_change_preserves_empty_and_missing_evidence(
         assert "evidence" not in payload
 
 
-def test_experiment_statistics_are_persisted_as_proposal_and_audit_evidence(tmp_path):
+def test_unregistered_aggregate_comparison_cannot_promote(tmp_path):
     store = Store(str(tmp_path / "state.sqlite3"))
     controller = Controller("http://simulator.test", str(store.path), store=store)
-    api = _ApprovalApi()
-    controller.client = api
     store.set_experiment_dimension("wf", "voice")
     events = []
-    for variant, connected_count, engaged_count in (
-        ("V1", 120, 60),
-        ("V2", 160, 112),
-    ):
-        for index in range(200):
-            event = _call_event(event_id=len(events) + 1)
-            event["config_version"] = 7
-            event["variant"]["voice"] = variant
-            event["connected"] = index < connected_count
-            event["engaged"] = index < engaged_count
-            events.append(json.dumps(event))
-    store.process_chunk(
-        {"chunk": 1, "kind": "events", "last_event_id": len(events)},
-        ("\n".join(events) + "\n").encode(),
-    )
-    config = {
-        "allocations": {"default": {"voice": {"V1": 0.5, "V2": 0.5}}},
-        "prompt_version": "P1",
-    }
-    experiment_spec = {
-        "objective": {"primary": "engagement_rate", "guardrail": {}},
-        "options": {"voice": ["V1", "V2"]},
-    }
-
-    result = asyncio.run(
-        controller._experiment_change("wf", experiment_spec, config, 7)
-    )
-
-    assert result is not None
-    revised, reason = result
-    evidence = revised["_evidence"]
-    assert evidence["workflow_id"] == "wf"
-    assert evidence["cohort_id"] == "default"
-    assert evidence["dimension"] == "voice"
-    assert evidence["config_version"] == 7
-    assert evidence["primary_kpi"] == "engagement_rate"
-    assert evidence["control"] == {
-        "variant": "V1",
-        "rate": 0.5,
-        "sample_size": 120,
-    }
-    assert evidence["candidate"] == {
-        "variant": "V2",
-        "rate": 0.7,
-        "sample_size": 160,
-    }
-    assert evidence["absolute_lift"] == pytest.approx(0.2)
-    assert evidence["statistical_test"]["name"] == "two_proportion_z"
-    assert evidence["statistical_test"]["z_score"] > 2.58
-
-    proposal_spec = {
-        "governance": {
-            "auto_apply": {"enabled": False},
-            "approver_hours": [10, 19],
-        },
-        "daily_batch": {"size": 300},
-    }
-    asyncio.run(controller._submit_change(
-        "wf",
-        proposal_spec,
-        {"version": 7, "config": config},
-        revised,
-        reason,
-        "2027-01-04T10:00:00+05:30",
-    ))
-
-    payload = json.loads(store.proposals("wf")[0]["payload"])
-    assert payload["evidence"] == evidence
-    approval_audit = next(
-        row for row in store.audit_rows("wf")
-        if row["action"] == "approval_requested"
-    )
-    assert approval_audit["detail"]["evidence"] == evidence
-
-
-@pytest.mark.parametrize(
-    ("engaged_counts", "expected_winner", "expected_ab_delta"),
-    [
-        ((112, 80), "V1", 0.2),
-        ((80, 112), "V2", -0.2),
-    ],
-    ids=["variant_a_wins", "variant_b_wins"],
-)
-def test_experiment_winner_lift_is_reported_in_winner_direction(
-    tmp_path, engaged_counts, expected_winner, expected_ab_delta
-):
-    store = Store(str(tmp_path / "state.sqlite3"))
-    controller = Controller("http://simulator.test", str(store.path), store=store)
-    api = _ApprovalApi()
-    controller.client = api
-    store.set_experiment_dimension("wf", "voice")
-    events = []
-    for variant, engaged_count in zip(("V1", "V2"), engaged_counts):
+    for variant, engaged_count in (("V1", 160), ("V2", 120)):
         for index in range(200):
             event = _call_event(event_id=len(events) + 1)
             event["config_version"] = 7
@@ -553,54 +642,9 @@ def test_experiment_winner_lift_is_reported_in_winner_direction(
         controller._experiment_change("wf", experiment_spec, config, 7)
     )
 
-    assert result is not None
-    revised, reason = result
-    winner = revised["allocations"]["default"]["voice"]
-    assert winner[expected_winner] == 0.8
-    loser = next(variant for variant in ("V1", "V2") if variant != expected_winner)
-    assert winner[loser] == 0.2
-
-    arm_a_rate = engaged_counts[0] / 160
-    arm_b_rate = engaged_counts[1] / 160
-    assert arm_a_rate - arm_b_rate == pytest.approx(expected_ab_delta)
-    candidate_rate = max(arm_a_rate, arm_b_rate)
-    control_rate = min(arm_a_rate, arm_b_rate)
-    expected_winner_lift = candidate_rate - control_rate
-    assert expected_winner_lift > 0
-    rationale_lift = float(reason.split("delta ", 1)[1].split(",", 1)[0])
-    assert rationale_lift == pytest.approx(expected_winner_lift)
-
-    evidence = revised["_evidence"]
-    assert evidence["candidate"]["variant"] == expected_winner
-    assert evidence["control"]["variant"] == loser
-    assert evidence["statistical_test"]["effect_delta"] == pytest.approx(
-        expected_winner_lift
-    )
-
-    proposal_spec = {
-        "governance": {
-            "auto_apply": {"enabled": False},
-            "approver_hours": [10, 19],
-        },
-        "daily_batch": {"size": 300},
-    }
-    asyncio.run(controller._submit_change(
-        "wf",
-        proposal_spec,
-        {"version": 7, "config": config},
-        revised,
-        reason,
-        "2027-01-04T10:00:00+05:30",
-    ))
-
-    proposal = store.proposals("wf")[0]
-    proposal_evidence = json.loads(proposal["payload"])["evidence"]
-    approval_audit = next(
-        row for row in store.audit_rows("wf")
-        if row["action"] == "approval_requested"
-    )
-    assert proposal_evidence == evidence
-    assert approval_audit["detail"]["evidence"] == proposal_evidence
+    assert result is None
+    assert store.proposals("wf") == []
+    assert store.audit_rows("wf") == []
 
 
 @pytest.mark.parametrize(
@@ -1053,6 +1097,370 @@ def test_saving_conflict_cannot_overwrite_applied_proposal_or_audit(tmp_path):
     assert store.proposal(payload["proposal_id"])["status"] == "applied"
 
 
+def test_applied_finalization_rolls_back_status_audit_and_cursor_together(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    payload = _proposal_payload()
+    _save_approved_proposal(store, payload, "approval-original")
+    store.set_experiment_dimension("wf", "voice")
+    with store._connection() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_applied_audit
+               BEFORE INSERT ON audit
+               WHEN NEW.action='approval_applied'
+               BEGIN SELECT RAISE(ABORT, 'audit insert rejected'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="audit insert rejected"):
+        store.finalize_applied_proposal(
+            payload["proposal_id"],
+            "approval-original",
+            "2027-01-04T10:00:00+05:30",
+            "approval_applied",
+            {"proposal_id": payload["proposal_id"]},
+            advance_cursor=True,
+            primary_kpi="engagement_rate",
+        )
+
+    assert store.proposal(payload["proposal_id"])["status"] == "approved"
+    assert store.experiment_dimension("wf", "welcome_message") == "voice"
+    assert store.proposal_cursor_advancement(payload["proposal_id"]) is None
+    assert store.audit_rows("wf") == []
+
+
+def test_cursor_update_failure_rolls_back_applied_audit_and_ledger(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    payload = _proposal_payload()
+    _save_approved_proposal(store, payload, "approval-original")
+    store.set_experiment_dimension("wf", "voice")
+    with store._connection() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_cursor_update
+               BEFORE UPDATE ON experiment_cursor
+               BEGIN SELECT RAISE(ABORT, 'cursor update rejected'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="cursor update rejected"):
+        store.finalize_applied_proposal(
+            payload["proposal_id"],
+            "approval-original",
+            "2027-01-04T10:00:00+05:30",
+            "approval_applied",
+            {"proposal_id": payload["proposal_id"]},
+            advance_cursor=True,
+            primary_kpi="engagement_rate",
+        )
+
+    assert store.proposal(payload["proposal_id"])["status"] == "approved"
+    assert store.experiment_dimension("wf", "welcome_message") == "voice"
+    assert store.proposal_cursor_advancement(payload["proposal_id"]) is None
+    assert store.audit_rows("wf") == []
+
+
+def test_applied_finalization_is_idempotent_for_audit_and_cursor(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    payload = _proposal_payload()
+    _save_approved_proposal(store, payload, "approval-original")
+    store.set_experiment_dimension("wf", "voice")
+    detail = {"proposal_id": payload["proposal_id"], "workflow_id": "wf"}
+
+    assert store.finalize_applied_proposal(
+        payload["proposal_id"],
+        "approval-original",
+        "2027-01-04T10:00:00+05:30",
+        "approval_applied",
+        detail,
+        advance_cursor=True,
+        primary_kpi="engagement_rate",
+    )
+    assert not store.finalize_applied_proposal(
+        payload["proposal_id"],
+        "approval-original",
+        "2027-01-04T10:15:00+05:30",
+        "approval_applied_reconciled",
+        detail,
+        advance_cursor=True,
+        primary_kpi="engagement_rate",
+    )
+
+    assert store.proposal(payload["proposal_id"])["status"] == "applied"
+    assert store.experiment_dimension("wf", "welcome_message") == "welcome_message"
+    assert [row["action"] for row in store.audit_rows("wf")] == [
+        "approval_applied"
+    ]
+    assert store.proposal_cursor_advancement(payload["proposal_id"]) == "advanced"
+
+
+def test_applied_cursor_advancement_survives_restart(tmp_path):
+    db_path = str(tmp_path / "state.sqlite3")
+    store = Store(db_path)
+    payload = _proposal_payload()
+    _save_approved_proposal(store, payload, "approval-original")
+    store.set_experiment_dimension("wf", "voice")
+
+    assert store.finalize_applied_proposal(
+        payload["proposal_id"],
+        "approval-original",
+        "2027-01-04T10:00:00+05:30",
+        "approval_applied",
+        {"proposal_id": payload["proposal_id"]},
+        advance_cursor=True,
+        primary_kpi="engagement_rate",
+    )
+    restarted_store = Store(db_path)
+
+    assert restarted_store.proposal_cursor_advancement(
+        payload["proposal_id"]
+    ) == "advanced"
+    assert restarted_store.experiment_dimension("wf", "welcome_message") == "welcome_message"
+    assert not restarted_store.finalize_applied_proposal(
+        payload["proposal_id"],
+        "approval-original",
+        "2027-01-04T10:15:00+05:30",
+        "approval_applied_reconciled",
+        {"proposal_id": payload["proposal_id"]},
+        advance_cursor=True,
+        primary_kpi="engagement_rate",
+    )
+    assert restarted_store.experiment_dimension("wf", "welcome_message") == "welcome_message"
+
+
+def test_legacy_applied_promotion_is_marked_ambiguous_on_migration(tmp_path):
+    db_path = str(tmp_path / "state.sqlite3")
+    store = Store(db_path)
+    payload = _proposal_payload()
+    payload["rationale"] = "Promote V2 after a completed experiment."
+    _save_approved_proposal(store, payload, "approval-original")
+    with store._connection() as connection:
+        connection.execute(
+            "UPDATE proposals SET status='applied' WHERE proposal_id=?",
+            (payload["proposal_id"],),
+        )
+        connection.execute(
+            """INSERT INTO audit(ts, workflow_id, action, detail)
+               VALUES (?, ?, ?, ?)""",
+            ("2027-01-04T10:00:00+05:30", "wf", "approval_applied",
+             json.dumps({"proposal_id": payload["proposal_id"]})),
+        )
+        connection.execute("DROP TABLE proposal_cursor_advancements")
+        connection.execute("DROP TABLE store_migrations")
+    store.set_experiment_dimension("wf", "voice")
+
+    migrated_store = Store(db_path)
+
+    assert migrated_store.proposal_cursor_advancement(
+        payload["proposal_id"]
+    ) == "legacy_unverified"
+    assert migrated_store.experiment_dimension("wf", "welcome_message") == "voice"
+    controller = Controller(
+        "http://simulator.test", db_path, store=migrated_store
+    )
+    controller.client = _ApprovalRecoveryApi([])
+    controller._workflow_specs["wf"] = {
+        "objective": {"primary": "engagement_rate"}
+    }
+
+    asyncio.run(controller._reconcile("2027-01-04T10:30:00+05:30", plan=False))
+
+    assert migrated_store.experiment_dimension("wf", "welcome_message") == "voice"
+    assert migrated_store.proposal_cursor_advancement(
+        payload["proposal_id"]
+    ) == "legacy_unverified"
+
+
+def test_reconcile_repairs_applied_promotion_without_audit_or_cursor(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    payload = _proposal_payload()
+    payload["rationale"] = "Promote V2 after planned look 3."
+    _save_approved_proposal(store, payload, "approval-original")
+    with store._connection() as connection:
+        connection.execute(
+            "UPDATE proposals SET status='applied' WHERE proposal_id=?",
+            (payload["proposal_id"],),
+        )
+    store.set_experiment_dimension("wf", "voice")
+    api = _ApprovalRecoveryApi([], history_entries=[{
+        "version": payload["base_version"] + 1,
+        "proposal_id": payload["proposal_id"],
+        "approval_id": "approval-original",
+        "actor": "controller_approved",
+    }])
+    controller = Controller("http://simulator.test", str(store.path), store=store)
+    controller.client = api
+    controller._workflow_specs["wf"] = {
+        "objective": {"primary": "engagement_rate"}
+    }
+
+    asyncio.run(controller._reconcile("2027-01-04T10:30:00+05:30", plan=False))
+
+    assert store.proposal(payload["proposal_id"])["status"] == "applied"
+    assert store.proposal_cursor_advancement(payload["proposal_id"]) == "advanced"
+    assert store.experiment_dimension("wf", "welcome_message") == "welcome_message"
+    assert [row["action"] for row in store.audit_rows("wf")] == [
+        "approval_applied_reconciled"
+    ]
+
+
+def test_reconcile_repairs_applied_promotion_with_audit_but_no_cursor(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    payload = _proposal_payload()
+    payload["rationale"] = "Promote V2 after planned look 3."
+    _save_approved_proposal(store, payload, "approval-original")
+    with store._connection() as connection:
+        connection.execute(
+            "UPDATE proposals SET status='applied' WHERE proposal_id=?",
+            (payload["proposal_id"],),
+        )
+        connection.execute(
+            """INSERT INTO audit(ts, workflow_id, action, detail)
+               VALUES (?, ?, ?, ?)""",
+            ("2027-01-04T10:00:00+05:30", "wf", "approval_applied",
+             json.dumps({"proposal_id": payload["proposal_id"]})),
+        )
+    store.set_experiment_dimension("wf", "voice")
+    api = _ApprovalRecoveryApi(
+        [], approvals_error_once=RemoteError(
+            503, "temporarily_unavailable", "approval list unavailable"
+        )
+    )
+    controller = Controller("http://simulator.test", str(store.path), store=store)
+    controller.client = api
+    controller._workflow_specs["wf"] = {
+        "objective": {"primary": "engagement_rate"}
+    }
+
+    with pytest.raises(RemoteError):
+        asyncio.run(controller._reconcile(
+            "2027-01-04T10:30:00+05:30", plan=False
+        ))
+
+    assert api.history_gets == 0
+    assert store.proposal_cursor_advancement(payload["proposal_id"]) == "advanced"
+    assert store.experiment_dimension("wf", "welcome_message") == "welcome_message"
+    assert len(store.audit_rows("wf")) == 1
+    asyncio.run(controller._reconcile("2027-01-04T10:45:00+05:30", plan=False))
+    assert store.experiment_dimension("wf", "welcome_message") == "welcome_message"
+
+
+def test_repeated_reconcile_does_not_toggle_cursor_repeatedly(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    payload = _proposal_payload()
+    payload["rationale"] = "Promote V2 after planned look 3."
+    _save_approved_proposal(store, payload, "approval-original")
+    with store._connection() as connection:
+        connection.execute(
+            "UPDATE proposals SET status='applied' WHERE proposal_id=?",
+            (payload["proposal_id"],),
+        )
+        connection.execute(
+            """INSERT INTO audit(ts, workflow_id, action, detail)
+               VALUES (?, ?, ?, ?)""",
+            ("2027-01-04T10:00:00+05:30", "wf", "approval_applied",
+             json.dumps({"proposal_id": payload["proposal_id"]})),
+        )
+    store.set_experiment_dimension("wf", "voice")
+    controller = Controller("http://simulator.test", str(store.path), store=store)
+    controller.client = _ApprovalRecoveryApi([])
+    controller._workflow_specs["wf"] = {
+        "objective": {"primary": "engagement_rate"}
+    }
+
+    asyncio.run(controller._reconcile("2027-01-04T10:30:00+05:30", plan=False))
+    asyncio.run(controller._reconcile("2027-01-04T10:45:00+05:30", plan=False))
+
+    assert store.experiment_dimension("wf", "welcome_message") == "welcome_message"
+    assert store.proposal_cursor_advancement(payload["proposal_id"]) == "advanced"
+    assert len(store.audit_rows("wf")) == 1
+
+
+def test_reconcile_never_applies_pending_remote_approval(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    payload = _proposal_payload()
+    store.save_proposal(
+        payload["proposal_id"],
+        payload["workflow_id"],
+        payload["base_version"],
+        "approval",
+        "submitted",
+        payload,
+        "approval-original",
+    )
+    api = _ApprovalRecoveryApi([{
+        "approval_id": "approval-original",
+        "proposal_id": payload["proposal_id"],
+        "workflow_id": payload["workflow_id"],
+        "base_version": payload["base_version"],
+        "status": "pending",
+    }])
+    controller = Controller("http://simulator.test", str(store.path), store=store)
+    controller.client = api
+
+    asyncio.run(controller._reconcile("2027-01-04T10:00:00+05:30", plan=False))
+
+    assert store.proposal(payload["proposal_id"])["status"] == "pending"
+    assert api.application_posts == []
+    assert store.audit_rows("wf") == []
+
+
+def test_failed_applied_audit_finalization_recovers_from_remote_history(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    payload = _proposal_payload()
+    _save_approved_proposal(store, payload, "approval-original")
+    assert store.mark_application_attempted(
+        payload["proposal_id"], "approval-original"
+    )
+    with store._connection() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_reconciled_audit
+               BEFORE INSERT ON audit
+               WHEN NEW.action='approval_applied_reconciled'
+               BEGIN SELECT RAISE(ABORT, 'audit insert rejected'); END"""
+        )
+    api = _ApprovalRecoveryApi(
+        [{
+            "approval_id": "approval-original",
+            "proposal_id": payload["proposal_id"],
+            "workflow_id": "wf",
+            "base_version": 7,
+            "status": "approved",
+        }],
+        config_version=8,
+        history_entries=[{
+            "version": 8,
+            "actor": "controller_approved",
+            "applied_at": "2027-01-04T10:20:00+05:30",
+            "proposal_id": payload["proposal_id"],
+            "approval_id": "approval-original",
+        }],
+    )
+    controller = Controller(
+        "http://simulator.test", str(store.path), store=store
+    )
+    controller.client = api
+
+    with pytest.raises(sqlite3.IntegrityError, match="audit insert rejected"):
+        asyncio.run(controller._reconcile(
+            "2027-01-04T10:30:00+05:30", plan=False
+        ))
+
+    assert store.proposal(payload["proposal_id"])["status"] == "approved"
+    assert store.proposal(payload["proposal_id"])["application_attempted"] == 1
+    assert store.audit_rows("wf") == []
+    assert api.application_posts == []
+
+    with store._connection() as connection:
+        connection.execute("DROP TRIGGER reject_reconciled_audit")
+    asyncio.run(controller._reconcile(
+        "2027-01-04T10:45:00+05:30", plan=False
+    ))
+
+    assert store.proposal(payload["proposal_id"])["status"] == "applied"
+    assert [row["action"] for row in store.audit_rows("wf")] == [
+        "approval_applied_reconciled"
+    ]
+    assert api.history_gets == 2
+    assert api.application_posts == []
+
+
 def test_concurrent_reconcile_does_not_duplicate_or_conflict_application(tmp_path):
     db_path = str(tmp_path / "state.sqlite3")
     store = Store(db_path)
@@ -1122,6 +1530,488 @@ def _register_experiment(
     )
     if start:
         store.start_experiment(experiment_id, 10)
+
+
+def _register_evaluation_experiment(
+    store, *, experiment_id="evaluation", primary_kpi="engagement_rate",
+    guardrail_kpi="pickup_rate", target_primary_n=80, target_guardrail_n=120,
+):
+    family_id = f"family-{experiment_id}"
+    store.create_experiment_family(
+        family_id, 0.01, 2, "2027-01-04T09:00:00+05:30"
+    )
+    store.register_experiment(
+        experiment_id,
+        family_id,
+        "wf",
+        "default",
+        3,
+        "voice",
+        "V1",
+        "V2",
+        primary_kpi,
+        guardrail_kpi,
+        "2027-01-04T09:00:00+05:30",
+        guardrail_margin=0.25,
+        baseline_primary=0.5,
+        baseline_guardrail=0.8,
+        practical_effect=0.015,
+        target_power=0.8,
+        target_primary_n=target_primary_n,
+        target_guardrail_n=target_guardrail_n,
+        design={"target_effect": 0.015, "target_power": 0.8},
+    )
+    store.freeze_experiment_family(
+        family_id, "2027-01-04T09:15:00+05:30"
+    )
+    store.start_experiment(experiment_id, 0)
+
+
+def _planned_experiment_events(
+    *, start_event_id=1, count_per_variant=120, mode="inconclusive",
+    primary_kpi="engagement_rate",
+):
+    events = []
+    for index in range(count_per_variant):
+        for variant in ("V1", "V2"):
+            event_id = start_event_id + len(events)
+            event = _call_event(event_id)
+            event.update({
+                "person_id": f"person-{event_id}",
+                "attempt_no": 1,
+                "config_version": 3,
+            })
+            event["variant"]["voice"] = variant
+
+            if primary_kpi == "pickup_rate":
+                connected_ranges = (
+                    ((0, 42), (60, 81), (90, 111))
+                    if variant == "V1"
+                    else ((0, 54), (60, 87), (90, 117))
+                )
+                connected = any(
+                    start <= index < end for start, end in connected_ranges
+                )
+                engaged_ranges = (
+                    ((0, 21), (60, 70), (90, 100))
+                    if variant == "V1"
+                    else ((0, 27), (60, 73), (90, 103))
+                )
+                engaged = any(
+                    start <= index < end for start, end in engaged_ranges
+                )
+            else:
+                if mode == "guardrail_failure":
+                    connected_ranges = (
+                        ((0, 54), (60, 87), (90, 117))
+                        if variant == "V1"
+                        else ((0, 42), (60, 81), (90, 111))
+                    )
+                else:
+                    connected_ranges = ((0, 48), (60, 84), (90, 114))
+                connected = any(
+                    start <= index < end for start, end in connected_ranges
+                )
+                if mode == "guardrail_failure":
+                    engaged_ranges = (
+                        ((0, 27), (60, 74), (90, 104))
+                        if variant == "V1"
+                        else ((0, 34), (60, 77), (90, 107))
+                    )
+                elif mode == "beneficial" and variant == "V2":
+                    engaged_ranges = ((0, 36), (60, 78), (90, 114))
+                else:
+                    engaged_ranges = ((0, 24), (60, 72), (90, 102))
+                engaged = any(
+                    start <= index < end for start, end in engaged_ranges
+                ) and connected
+            event["connected"] = connected
+            event["engaged"] = engaged
+            events.append(json.dumps(event))
+    return events
+
+
+def _guardrail_score_result(
+    candidate_successes, control_successes, sample_size
+):
+    observations = []
+    for variant, successes in (
+        ("V2", candidate_successes),
+        ("V1", control_successes),
+    ):
+        for index in range(sample_size):
+            observations.append({
+                "event_id": len(observations) + 1,
+                "variant": variant,
+                "connected": 1,
+                "engaged": int(index < successes),
+            })
+    experiment = {
+        "experiment_id": "score-bound",
+        "candidate_variant": "V2",
+        "control_variant": "V1",
+        "primary_kpi": "pickup_rate",
+        "guardrail_kpi": "engagement_rate",
+        "guardrail_margin": 0.02,
+        "practical_effect": 0.015,
+    }
+    family = {
+        "alpha_per_hypothesis_per_look": 0.01 / 6,
+        "look_count": 3,
+    }
+    look = {"look_number": 3, "cutoff_event_id": 2 * sample_size}
+    return _evaluate_experiment_look(
+        experiment, family, observations, look
+    )[1]["guardrail"]
+
+
+@pytest.mark.parametrize(
+    ("candidate_successes", "control_successes", "sample_size"),
+    [
+        (0, 0, 100),
+        (100, 100, 100),
+        (0, 25, 100),
+        (2, 4, 100),
+        (96, 98, 100),
+    ],
+)
+def test_guardrail_score_bound_rejects_probability_boundary_approval(
+    candidate_successes, control_successes, sample_size
+):
+    guardrail = _guardrail_score_result(
+        candidate_successes, control_successes, sample_size
+    )
+
+    assert guardrail["safe"] is False
+    assert guardrail["lower_confidence_bound"] <= -guardrail["margin"]
+    assert guardrail["lower_confidence_bound_method"] == (
+        "Newcombe-Wilson hybrid score"
+    )
+    assert guardrail["confidence_level"] == pytest.approx(1 - 0.01 / 6)
+    assert guardrail["critical_value"] == pytest.approx(
+        statistics.NormalDist().inv_cdf(1 - 0.01 / 6)
+    )
+
+
+def test_guardrail_score_bound_accepts_clear_safe_case():
+    guardrail = _guardrail_score_result(80000, 80000, 100000)
+
+    assert guardrail["safe"] is True
+    assert guardrail["lower_confidence_bound"] > -guardrail["margin"]
+
+
+def test_guardrail_score_bound_rejects_clear_unsafe_case():
+    guardrail = _guardrail_score_result(70000, 85000, 100000)
+
+    assert guardrail["safe"] is False
+    assert guardrail["lower_confidence_bound"] <= -guardrail["margin"]
+
+
+def _ingest_planned_events(store, events, chunk_number):
+    if not events:
+        return
+    last_event_id = json.loads(events[-1])["event_id"]
+    store.process_chunk(
+        {"chunk": chunk_number, "kind": "events",
+         "last_event_id": last_event_id},
+        ("\n".join(events) + "\n").encode(),
+    )
+
+
+class _ExperimentPromotionApi:
+    def __init__(self):
+        self.submissions = []
+        self.config = {
+            "allocations": {
+                "default": {"voice": {"V1": 0.5, "V2": 0.5}}
+            },
+            "prompt_version": "P1",
+        }
+
+    async def request(self, method, path, **kwargs):
+        if method == "GET" and path == "/workflows/wf/config":
+            return {"version": 3, "config": copy.deepcopy(self.config)}
+        if method == "POST" and path == "/approvals":
+            self.submissions.append(copy.deepcopy(kwargs["json"]))
+            return {
+                "approval_id": f"approval-{len(self.submissions)}",
+                "proposal_id": kwargs["json"]["proposal_id"],
+                "status": "pending",
+            }
+        raise AssertionError(f"Unexpected simulator request: {method} {path}")
+
+
+class _SimulatorLoopApi:
+    def __init__(
+        self, *, initial_minute=0, advance_mode="progress", workflows=None
+    ):
+        self.state = {
+            "sim_minute": initial_minute,
+            "ts": "2027-01-04T10:00:00+05:30",
+            "last_event_id": 0,
+            "finished": False,
+        }
+        self.advance_mode = advance_mode
+        self.workflows = copy.deepcopy(workflows or [])
+        self.advance_calls = 0
+        self.close_calls = 0
+        self.requests = []
+
+    async def request(self, method, path, **kwargs):
+        self.requests.append((method, path, copy.deepcopy(kwargs)))
+        if method == "GET" and path == "/sim/state":
+            return copy.deepcopy(self.state)
+        if method == "GET" and path == "/workflows":
+            return copy.deepcopy(self.workflows)
+        if method == "GET" and path == "/events/chunks":
+            return []
+        if method == "GET" and path == "/approvals":
+            return []
+        raise AssertionError(f"Unexpected simulator request: {method} {path}")
+
+    async def advance(self, minutes):
+        self.advance_calls += 1
+        if self.advance_mode == "progress":
+            self.state["sim_minute"] += minutes
+            self.state["finished"] = self.state["sim_minute"] >= 120
+        elif self.advance_mode == "backwards":
+            self.state["sim_minute"] -= 1
+        elif self.advance_mode == "finish_without_clock_change":
+            self.state["finished"] = True
+        return copy.deepcopy(self.state)
+
+    async def get_chunk(self, chunk_number):
+        raise AssertionError("No simulator chunks are expected")
+
+    async def close(self):
+        self.close_calls += 1
+
+
+def _experiment_simulator_state(last_event_id, *, finished=False):
+    return {
+        "last_event_id": last_event_id,
+        "finished": finished,
+        "ts": "2027-01-04T10:00:00+05:30",
+    }
+
+
+def test_registered_experiment_uses_planned_samples_and_recovers_after_restart(
+    tmp_path,
+):
+    db_path = str(tmp_path / "state.sqlite3")
+    store = Store(db_path)
+    _register_evaluation_experiment(store)
+    events = _planned_experiment_events()
+
+    _ingest_planned_events(store, events[:80], 1)
+    controller = Controller("http://simulator.test", db_path, store=store)
+    asyncio.run(controller._evaluate_registered_experiments(
+        _experiment_simulator_state(80)
+    ))
+    assert [look["status"] for look in store.experiment_looks("evaluation")] == [
+        "planned", "planned", "planned"
+    ]
+
+    _ingest_planned_events(store, events[80:120], 2)
+    asyncio.run(controller._evaluate_registered_experiments(
+        _experiment_simulator_state(120)
+    ))
+    first_look = store.experiment_looks("evaluation")[0]
+    assert first_look["status"] == "evaluated"
+    assert first_look["cutoff_event_id"] == 120
+    assert json.loads(first_look["result_json"])["outcome"] == "continue"
+    assert store.experiments("running")[0]["status"] == "running"
+
+    restarted_store = Store(db_path)
+    restarted_controller = Controller(
+        "http://simulator.test", db_path, store=restarted_store
+    )
+    asyncio.run(restarted_controller._evaluate_registered_experiments(
+        _experiment_simulator_state(120)
+    ))
+    assert len([
+        row for row in restarted_store.audit_rows("wf")
+        if row["action"] == "experiment_look_evaluated"
+    ]) == 1
+
+    _ingest_planned_events(store, events[120:180], 3)
+    asyncio.run(restarted_controller._evaluate_registered_experiments(
+        _experiment_simulator_state(180)
+    ))
+    assert store.experiment_looks("evaluation")[1]["status"] == "evaluated"
+    assert len(store.experiment_observations("evaluation")) == 180
+
+    _ingest_planned_events(store, events[180:], 4)
+    asyncio.run(restarted_controller._evaluate_registered_experiments(
+        _experiment_simulator_state(240)
+    ))
+    looks = store.experiment_looks("evaluation")
+    experiment = store.experiments()[0]
+    assert [look["status"] for look in looks] == [
+        "evaluated", "evaluated", "evaluated"
+    ]
+    assert [look["cutoff_event_id"] for look in looks] == [120, 180, 240]
+    assert json.loads(looks[2]["result_json"])["outcome"] == "inconclusive"
+    assert experiment["status"] == "inconclusive"
+    assert experiment["end_event_id"] == 240
+    totals = store.arm_stats("wf", "default", 3, "voice")
+    assert totals["V1"].dials == totals["V2"].dials == 120
+    assert len([
+        row for row in store.audit_rows("wf")
+        if row["action"] == "experiment_look_evaluated"
+    ]) == 3
+
+
+def test_registered_experiment_promotes_beneficial_final_look_once(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    _register_evaluation_experiment(store)
+    _ingest_planned_events(
+        store, _planned_experiment_events(mode="beneficial"), 1
+    )
+    controller = Controller(
+        "http://simulator.test", str(store.path), store=store
+    )
+    controller.client = _ExperimentPromotionApi()
+    controller._workflow_specs["wf"] = {
+        "governance": {
+            "auto_apply": {"enabled": False},
+            "approver_hours": [10, 19],
+        },
+        "daily_batch": {"size": 300},
+    }
+
+    asyncio.run(controller._evaluate_registered_experiments(
+        _experiment_simulator_state(240)
+    ))
+    final_look = store.experiment_looks("evaluation")[2]
+    result = json.loads(final_look["result_json"])
+    assert final_look["status"] == "evaluated"
+    assert result["outcome"] == "beneficial"
+    assert result["primary_kpi"] == "engagement_rate"
+    assert result["primary_delta"] >= 0.015
+    assert result["primary_significant"]
+    assert result["guardrail"]["safe"]
+    assert len(controller.client.submissions) == 1
+
+    asyncio.run(controller._evaluate_registered_experiments(
+        _experiment_simulator_state(240)
+    ))
+    assert len(controller.client.submissions) == 1
+    proposals = store.proposals("wf")
+    assert len(proposals) == 1
+    assert len([
+        row for row in store.audit_rows("wf")
+        if row["action"] == "approval_requested"
+    ]) == 1
+
+
+def test_registered_experiment_guardrail_blocks_primary_improvement(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    _register_evaluation_experiment(store)
+    _ingest_planned_events(
+        store, _planned_experiment_events(mode="guardrail_failure"), 1
+    )
+    controller = Controller(
+        "http://simulator.test", str(store.path), store=store
+    )
+    controller.client = _ExperimentPromotionApi()
+    controller._workflow_specs["wf"] = {
+        "governance": {
+            "auto_apply": {"enabled": False},
+            "approver_hours": [10, 19],
+        },
+        "daily_batch": {"size": 300},
+    }
+
+    asyncio.run(controller._evaluate_registered_experiments(
+        _experiment_simulator_state(240)
+    ))
+
+    result = json.loads(store.experiment_looks("evaluation")[2]["result_json"])
+    assert result["outcome"] == "guardrail_blocked"
+    assert result["primary_delta"] >= 0.015
+    assert result["guardrail"]["safe"] is False
+    assert store.proposals("wf") == []
+    assert controller.client.submissions == []
+
+
+def test_registered_experiment_can_test_pickup_as_primary_kpi(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    _register_evaluation_experiment(
+        store,
+        primary_kpi="pickup_rate",
+        guardrail_kpi="engagement_rate",
+        target_primary_n=120,
+        target_guardrail_n=80,
+    )
+    _ingest_planned_events(
+        store,
+        _planned_experiment_events(primary_kpi="pickup_rate"),
+        1,
+    )
+    controller = Controller(
+        "http://simulator.test", str(store.path), store=store
+    )
+
+    asyncio.run(controller._evaluate_registered_experiments(
+        _experiment_simulator_state(240)
+    ))
+
+    looks = store.experiment_looks("evaluation")
+    result = json.loads(looks[1]["result_json"])
+    assert looks[1]["status"] == "evaluated"
+    assert result["outcome"] == "beneficial"
+    assert result["primary_kpi"] == "pickup_rate"
+    assert result["primary_significant"]
+    assert result["primary_delta"] >= 0.015
+    assert result["guardrail"]["kpi"] == "engagement_rate"
+
+
+def test_registered_look_fractions_scale_minimum_final_targets(tmp_path):
+    store = Store(str(tmp_path / "state.sqlite3"))
+    _register_evaluation_experiment(
+        store,
+        primary_kpi="engagement_rate",
+        guardrail_kpi="pickup_rate",
+        target_primary_n=40,
+        target_guardrail_n=120,
+    )
+    events = []
+    for index in range(120):
+        for variant in ("V1", "V2"):
+            event = _call_event(len(events) + 1)
+            event.update({
+                "person_id": f"minimum-person-{len(events) + 1}",
+                "attempt_no": 1,
+                "config_version": 3,
+                "connected": index < 20 or 60 <= index < 80,
+                "engaged": False,
+            })
+            event["variant"]["voice"] = variant
+            events.append(json.dumps(event))
+    _ingest_planned_events(store, events, 1)
+    experiment = store.experiments()[0]
+    observations = store.experiment_observations("evaluation")
+    assert [
+        _planned_look_cutoff(observations, experiment, fraction)
+        for fraction in (0.5, 0.75, 1.0)
+    ] == [120, 180, 240]
+    controller = Controller(
+        "http://simulator.test", str(store.path), store=store
+    )
+
+    asyncio.run(controller._evaluate_registered_experiments(
+        _experiment_simulator_state(240)
+    ))
+
+    experiment = store.experiments()[0]
+    looks = store.experiment_looks("evaluation")
+    assert experiment["target_primary_n"] == 40
+    assert experiment["target_guardrail_n"] == 120
+    assert [look["cutoff_event_id"] for look in looks] == [120, 180, 240]
+    first_look = json.loads(looks[0]["result_json"])
+    assert first_look["control"]["sample_size"] == 20
+    assert first_look["candidate"]["sample_size"] == 20
 
 
 def test_experiment_plan_and_looks_survive_store_restart(tmp_path):
@@ -1487,8 +2377,11 @@ def test_look_scoped_observations_respect_each_event_cutoff(tmp_path):
     )
     store.start_experiment("exp-1", 10)
     store.start_experiment("exp-2", 10)
-    for look_number, cutoff in ((1, 12), (2, 14), (3, 16)):
-        store.set_experiment_look_cutoff("exp-1", look_number, cutoff)
+    for experiment_id in ("exp-1", "exp-2"):
+        for look_number, cutoff in ((1, 12), (2, 14), (3, 16)):
+            store.set_experiment_look_cutoff(
+                experiment_id, look_number, cutoff
+            )
 
     events = []
     for event_id, workflow_id, config_version, person_id in (

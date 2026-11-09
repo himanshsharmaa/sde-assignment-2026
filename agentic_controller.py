@@ -11,6 +11,7 @@ import math
 import os
 import random
 import sqlite3
+import statistics
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,10 +23,13 @@ import httpx
 
 LOG = logging.getLogger("agentic_controller")
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-MIN_ARM_DIALS = 120
-MIN_ARM_CONNECTED = 40
+MIN_REGISTERED_TARGET_ARM_DIALS = 120
+MIN_REGISTERED_TARGET_ARM_CONNECTED = 40
+MIN_ARM_DIALS = MIN_REGISTERED_TARGET_ARM_DIALS
+MIN_ARM_CONNECTED = MIN_REGISTERED_TARGET_ARM_CONNECTED
 MIN_INCIDENT_CALLS = 100
 CONFIDENCE_Z = 2.58
+MAX_CONSECUTIVE_NO_PROGRESS_ADVANCES = 3
 
 
 class RemoteError(RuntimeError):
@@ -205,6 +209,18 @@ class Store:
                     workflow_id TEXT PRIMARY KEY,
                     dimension TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS proposal_cursor_advancements (
+                    proposal_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('advanced', 'legacy_unverified')
+                    ),
+                    from_dimension TEXT,
+                    to_dimension TEXT
+                );
+                CREATE TABLE IF NOT EXISTS store_migrations (
+                    migration_id TEXT PRIMARY KEY
+                );
                 CREATE TABLE IF NOT EXISTS experiment_evaluations (
                     workflow_id TEXT NOT NULL,
                     config_version INTEGER NOT NULL,
@@ -314,6 +330,30 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS proposals_deferred_eligibility "
                 "ON proposals(status, eligible_at)"
             )
+            conn.execute("BEGIN IMMEDIATE")
+            migration = "proposal_cursor_advancements_v1"
+            migration_done = conn.execute(
+                "SELECT 1 FROM store_migrations WHERE migration_id=?",
+                (migration,),
+            ).fetchone()
+            if migration_done is None:
+                legacy_applied = conn.execute(
+                    """SELECT proposal_id, workflow_id, payload FROM proposals
+                       WHERE status='applied'"""
+                ).fetchall()
+                for proposal in legacy_applied:
+                    payload = json.loads(proposal["payload"])
+                    if str(payload.get("rationale", "")).startswith("Promote "):
+                        conn.execute(
+                            """INSERT OR IGNORE INTO proposal_cursor_advancements
+                               (proposal_id, workflow_id, status)
+                               VALUES (?, ?, 'legacy_unverified')""",
+                            (proposal["proposal_id"], proposal["workflow_id"]),
+                        )
+                conn.execute(
+                    "INSERT INTO store_migrations(migration_id) VALUES (?)",
+                    (migration,),
+                )
 
     def last_chunk(self) -> int:
         with self._connection() as conn:
@@ -661,53 +701,42 @@ class Store:
                 raise ValueError("unknown experiment look")
             if row["status"] != "running":
                 raise ValueError("look cutoff requires a running experiment")
-            family_looks = conn.execute(
-                """SELECT e.experiment_id, e.start_event_id, l.cutoff_event_id
-                   FROM experiments e JOIN experiment_looks l
-                     ON l.experiment_id=e.experiment_id
-                   WHERE e.family_id=? AND e.status='running'
-                     AND l.look_number=?""",
-                (row["family_id"], look_number),
-            ).fetchall()
-            for member in family_looks:
-                if cutoff_event_id < int(member["start_event_id"]):
-                    raise ValueError("look cutoff precedes experiment start")
-                if member["cutoff_event_id"] is not None:
-                    if int(member["cutoff_event_id"]) != cutoff_event_id:
-                        raise ValueError("look cutoff is immutable")
-                if look_number > 1:
-                    previous = conn.execute(
-                        """SELECT cutoff_event_id FROM experiment_looks
-                           WHERE experiment_id=? AND look_number=?""",
-                        (member["experiment_id"], look_number - 1),
-                    ).fetchone()
-                    if previous is None or previous["cutoff_event_id"] is None:
-                        raise ValueError("previous look cutoff must be established first")
-                    if cutoff_event_id <= int(previous["cutoff_event_id"]):
-                        raise ValueError("look cutoffs must increase strictly")
-                if look_number < 3:
-                    following = conn.execute(
-                        """SELECT cutoff_event_id FROM experiment_looks
-                           WHERE experiment_id=? AND look_number=?""",
-                        (member["experiment_id"], look_number + 1),
-                    ).fetchone()
-                    if following is not None and following["cutoff_event_id"] is not None:
-                        raise ValueError("look cutoff ordering is immutable")
-            changed = False
-            for member in family_looks:
-                cursor = conn.execute(
-                    """UPDATE experiment_looks SET cutoff_event_id=?, status='ready'
-                       WHERE experiment_id=? AND look_number=? AND cutoff_event_id IS NULL""",
-                    (cutoff_event_id, member["experiment_id"], look_number),
+            if cutoff_event_id < int(row["start_event_id"]):
+                raise ValueError("look cutoff precedes experiment start")
+            if row["cutoff_event_id"] is not None:
+                if int(row["cutoff_event_id"]) != cutoff_event_id:
+                    raise ValueError("look cutoff is immutable")
+                return False
+            if look_number > 1:
+                previous = conn.execute(
+                    """SELECT cutoff_event_id FROM experiment_looks
+                       WHERE experiment_id=? AND look_number=?""",
+                    (experiment_id, look_number - 1),
+                ).fetchone()
+                if previous is None or previous["cutoff_event_id"] is None:
+                    raise ValueError("previous look cutoff must be established first")
+                if cutoff_event_id <= int(previous["cutoff_event_id"]):
+                    raise ValueError("look cutoffs must increase strictly")
+            if look_number < 3:
+                following = conn.execute(
+                    """SELECT cutoff_event_id FROM experiment_looks
+                       WHERE experiment_id=? AND look_number=?""",
+                    (experiment_id, look_number + 1),
+                ).fetchone()
+                if following is not None and following["cutoff_event_id"] is not None:
+                    raise ValueError("look cutoff ordering is immutable")
+            cursor = conn.execute(
+                """UPDATE experiment_looks SET cutoff_event_id=?, status='ready'
+                   WHERE experiment_id=? AND look_number=? AND cutoff_event_id IS NULL""",
+                (cutoff_event_id, experiment_id, look_number),
+            )
+            if cursor.rowcount == 1 and look_number == 3:
+                conn.execute(
+                    """UPDATE experiments SET end_event_id=?
+                       WHERE experiment_id=? AND end_event_id IS NULL""",
+                    (cutoff_event_id, experiment_id),
                 )
-                changed = changed or cursor.rowcount == 1
-                if look_number == 3:
-                    conn.execute(
-                        """UPDATE experiments SET end_event_id=?
-                           WHERE experiment_id=? AND end_event_id IS NULL""",
-                        (cutoff_event_id, member["experiment_id"]),
-                    )
-        return changed
+        return cursor.rowcount == 1
 
     def experiment_family(self, family_id: str) -> dict[str, Any] | None:
         with self._connection() as conn:
@@ -782,11 +811,17 @@ class Store:
                 if look["cutoff_event_id"] is None:
                     raise ValueError("experiment look cutoff has not been established")
                 experiment = conn.execute(
-                    "SELECT start_event_id FROM experiments WHERE experiment_id=?",
+                    """SELECT start_event_id, end_event_id
+                       FROM experiments WHERE experiment_id=?""",
                     (experiment_id,),
                 ).fetchone()
                 if experiment is None:
                     raise ValueError(f"unknown experiment {experiment_id}")
+                cutoff_event_id = (
+                    experiment["end_event_id"]
+                    if look_number == 3 and experiment["end_event_id"] is not None
+                    else look["cutoff_event_id"]
+                )
                 rows = conn.execute(
                     """SELECT * FROM experiment_observations
                        WHERE experiment_id=? AND event_id>? AND event_id<=?
@@ -794,10 +829,112 @@ class Store:
                     (
                         experiment_id,
                         int(experiment["start_event_id"]),
-                        int(look["cutoff_event_id"]),
+                        int(cutoff_event_id),
                     ),
                 ).fetchall()
         return [dict(row) for row in rows]
+
+    def finalize_experiment_look(
+        self, experiment_id: str, look_number: int, outcome: str,
+        result: dict[str, Any], ts: str,
+    ) -> bool:
+        if outcome not in (
+            "continue", "beneficial", "inconclusive", "guardrail_blocked"
+        ):
+            raise ValueError(f"unsupported experiment look outcome {outcome}")
+        terminal = outcome != "continue"
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT e.workflow_id, e.status, l.status AS look_status,
+                          l.cutoff_event_id
+                   FROM experiments e JOIN experiment_looks l
+                     ON l.experiment_id=e.experiment_id
+                   WHERE e.experiment_id=? AND l.look_number=?""",
+                (experiment_id, look_number),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown experiment look")
+            if row["status"] != "running":
+                return False
+            if row["look_status"] == "evaluated":
+                return False
+            if row["look_status"] != "ready" or row["cutoff_event_id"] is None:
+                raise ValueError("experiment look must have a persisted cutoff")
+            cursor = conn.execute(
+                """UPDATE experiment_looks SET status='evaluated', result_json=?
+                   WHERE experiment_id=? AND look_number=? AND status='ready'""",
+                (json.dumps(result, sort_keys=True), experiment_id, look_number),
+            )
+            if cursor.rowcount != 1:
+                return False
+            if terminal:
+                conn.execute(
+                    """UPDATE experiments SET status=?, end_event_id=COALESCE(
+                           end_event_id, ?)
+                       WHERE experiment_id=? AND status='running'""",
+                    (outcome, row["cutoff_event_id"], experiment_id),
+                )
+            conn.execute(
+                """INSERT INTO audit(ts, workflow_id, action, detail)
+                   VALUES (?, ?, 'experiment_look_evaluated', ?)""",
+                (
+                    ts,
+                    row["workflow_id"],
+                    json.dumps(
+                        {"experiment_id": experiment_id,
+                         "look_number": look_number, "outcome": outcome,
+                         **result},
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return True
+
+    def mark_experiment_underpowered(
+        self, experiment_id: str, last_event_id: int, ts: str, reason: str,
+        result: dict[str, Any],
+    ) -> bool:
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT workflow_id, status FROM experiments
+                   WHERE experiment_id=?""",
+                (experiment_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown experiment {experiment_id}")
+            if row["status"] != "running":
+                return False
+            conn.execute(
+                """UPDATE experiments SET status='underpowered', end_event_id=?
+                   WHERE experiment_id=? AND status='running'""",
+                (last_event_id, experiment_id),
+            )
+            conn.execute(
+                """UPDATE experiment_looks SET status='underpowered',
+                       cutoff_event_id=COALESCE(cutoff_event_id, ?), result_json=?
+                   WHERE experiment_id=? AND look_number=3
+                     AND status IN ('planned', 'ready')""",
+                (
+                    last_event_id, json.dumps(
+                        {"outcome": "underpowered", "reason": reason, **result},
+                        sort_keys=True,
+                    ), experiment_id,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO audit(ts, workflow_id, action, detail)
+                   VALUES (?, ?, 'experiment_underpowered', ?)""",
+                (
+                    ts, row["workflow_id"],
+                    json.dumps(
+                        {"experiment_id": experiment_id, "reason": reason, **result},
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return True
 
     def arm_stats(
         self, workflow_id: str, cohort_id: str, version: int, dimension: str,
@@ -891,6 +1028,15 @@ class Store:
                    ON CONFLICT(workflow_id) DO UPDATE SET dimension=excluded.dimension""",
                 (workflow_id, dimension),
             )
+
+    def proposal_cursor_advancement(self, proposal_id: str) -> str | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT status FROM proposal_cursor_advancements
+                   WHERE proposal_id=?""",
+                (proposal_id,),
+            ).fetchone()
+        return str(row["status"]) if row else None
 
     def experiment_evaluated(self, workflow_id: str, version: int) -> bool:
         with self._connection() as conn:
@@ -990,34 +1136,111 @@ class Store:
             )
         return cursor.rowcount == 1
 
-    def mark_approval_applied(
-        self, proposal_id: str, approval_id: str, ts: str, action: str,
-        detail: dict[str, Any],
+    def finalize_applied_proposal(
+        self, proposal_id: str, approval_id: str | None, ts: str, action: str,
+        detail: dict[str, Any], *, advance_cursor: bool = False,
+        primary_kpi: str | None = None,
     ) -> bool:
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                """SELECT workflow_id, base_version, status FROM proposals
+                """SELECT workflow_id, status FROM proposals
                    WHERE proposal_id=?""",
                 (proposal_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"unknown proposal {proposal_id}")
             transitioned = row["status"] != "applied"
-            conn.execute(
-                """UPDATE proposals SET status='applied',
-                       approval_id=COALESCE(?, approval_id)
-                   WHERE proposal_id=?""",
-                (approval_id, proposal_id),
-            )
             if transitioned:
+                conn.execute(
+                    """UPDATE proposals SET status='applied',
+                           approval_id=COALESCE(?, approval_id)
+                       WHERE proposal_id=? AND status!='applied'""",
+                    (approval_id, proposal_id),
+                )
+            applied_actions = (
+                "auto_applied", "approval_applied", "approval_applied_reconciled"
+            )
+            existing_audits = conn.execute(
+                """SELECT action, detail FROM audit
+                   WHERE workflow_id=? AND action IN (?, ?, ?)""",
+                (row["workflow_id"], *applied_actions),
+            ).fetchall()
+            audit_exists = any(
+                json.loads(item["detail"]).get("proposal_id") == proposal_id
+                for item in existing_audits
+            )
+            if not audit_exists:
                 conn.execute(
                     """INSERT INTO audit(ts, workflow_id, action, detail)
                        VALUES (?, ?, ?, ?)""",
                     (ts, row["workflow_id"], action,
                      json.dumps(detail, sort_keys=True)),
                 )
+            if advance_cursor and primary_kpi == "engagement_rate":
+                advancement = conn.execute(
+                    """SELECT status FROM proposal_cursor_advancements
+                       WHERE proposal_id=?""",
+                    (proposal_id,),
+                ).fetchone()
+                if advancement is None:
+                    current = conn.execute(
+                        """SELECT dimension FROM experiment_cursor
+                           WHERE workflow_id=?""",
+                        (row["workflow_id"],),
+                    ).fetchone()
+                    dimension = (
+                        str(current["dimension"])
+                        if current else "welcome_message"
+                    )
+                    next_dimension = (
+                        "voice" if dimension == "welcome_message"
+                        else "welcome_message"
+                    )
+                    conn.execute(
+                        """INSERT INTO experiment_cursor(workflow_id, dimension)
+                           VALUES (?, ?)
+                           ON CONFLICT(workflow_id) DO UPDATE SET
+                               dimension=excluded.dimension""",
+                        (row["workflow_id"], next_dimension),
+                    )
+                    conn.execute(
+                        """INSERT INTO proposal_cursor_advancements
+                           (proposal_id, workflow_id, status, from_dimension,
+                            to_dimension)
+                           VALUES (?, ?, 'advanced', ?, ?)""",
+                        (proposal_id, row["workflow_id"], dimension, next_dimension),
+                    )
+                elif advancement["status"] == "legacy_unverified":
+                    LOG.warning(
+                        "Cursor advancement for legacy applied proposal %s "
+                        "is ambiguous; reconcile it manually before changing "
+                        "the experiment cursor",
+                        proposal_id,
+                    )
         return transitioned
+
+    def mark_approval_applied(
+        self, proposal_id: str, approval_id: str, ts: str, action: str,
+        detail: dict[str, Any],
+    ) -> bool:
+        return self.finalize_applied_proposal(
+            proposal_id, approval_id, ts, action, detail
+        )
+
+    def has_application_audit(self, proposal_id: str) -> bool:
+        applied_actions = (
+            "auto_applied", "approval_applied", "approval_applied_reconciled"
+        )
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT detail FROM audit WHERE action IN (?, ?, ?)""",
+                applied_actions,
+            ).fetchall()
+        return any(
+            json.loads(row["detail"]).get("proposal_id") == proposal_id
+            for row in rows
+        )
 
     def audit(self, ts: str, workflow_id: str, action: str, detail: dict[str, Any]) -> None:
         with self._connection() as conn:
@@ -1080,11 +1303,192 @@ def _two_proportion_z(x1: int, n1: int, x2: int, n2: int) -> tuple[float, float]
     return (p1 - p2) / se, p1 - p2
 
 
+def _metric_counts(arm: ArmStats, metric: str) -> tuple[int, int]:
+    if metric == "pickup_rate":
+        return arm.connected, arm.dials
+    if metric == "engagement_rate":
+        return arm.engaged, arm.connected
+    raise ValueError(f"unsupported KPI {metric}")
+
+
+def _experiment_arm_stats(
+    observations: list[dict[str, Any]], variant: str
+) -> ArmStats:
+    rows = [row for row in observations if row["variant"] == variant]
+    return ArmStats(
+        dials=len(rows),
+        connected=sum(int(row["connected"]) for row in rows),
+        engaged=sum(int(row["engaged"]) for row in rows),
+        hallucination_flags=0,
+    )
+
+
+def _planned_look_cutoff(
+    observations: list[dict[str, Any]], experiment: dict[str, Any], fraction: float
+) -> int | None:
+    primary_metric = experiment["primary_kpi"]
+    guardrail_metric = experiment["guardrail_kpi"]
+    primary_target = math.ceil(int(experiment["target_primary_n"]) * fraction)
+    guardrail_target = math.ceil(int(experiment["target_guardrail_n"]) * fraction)
+    counts = {
+        experiment["control_variant"]: ArmStats(0, 0, 0, 0),
+        experiment["candidate_variant"]: ArmStats(0, 0, 0, 0),
+    }
+    for row in observations:
+        variant = row["variant"]
+        current = counts.get(variant)
+        if current is None:
+            continue
+        counts[variant] = ArmStats(
+            dials=current.dials + 1,
+            connected=current.connected + int(row["connected"]),
+            engaged=current.engaged + int(row["engaged"]),
+            hallucination_flags=0,
+        )
+        if all(
+            _metric_counts(arm, primary_metric)[1] >= primary_target
+            and _metric_counts(arm, guardrail_metric)[1] >= guardrail_target
+            for arm in counts.values()
+        ):
+            return int(row["event_id"])
+    return None
+
+
+def _wilson_score_interval(
+    successes: int, sample_size: int, critical_value: float
+) -> tuple[float, float]:
+    if sample_size <= 0 or not 0 <= successes <= sample_size:
+        raise ValueError("Wilson interval requires valid binomial counts")
+    rate = successes / sample_size
+    z_squared = critical_value * critical_value
+    denominator = 1 + z_squared / sample_size
+    center = (rate + z_squared / (2 * sample_size)) / denominator
+    half_width = (
+        critical_value
+        * math.sqrt(
+            rate * (1 - rate) / sample_size
+            + z_squared / (4 * sample_size * sample_size)
+        )
+        / denominator
+    )
+    return max(0.0, center - half_width), min(1.0, center + half_width)
+
+
+def _newcombe_wilson_lower_bound(
+    candidate_successes: int,
+    candidate_sample_size: int,
+    control_successes: int,
+    control_sample_size: int,
+    critical_value: float,
+) -> float:
+    candidate_rate = candidate_successes / candidate_sample_size
+    control_rate = control_successes / control_sample_size
+    candidate_lower, _ = _wilson_score_interval(
+        candidate_successes, candidate_sample_size, critical_value
+    )
+    _, control_upper = _wilson_score_interval(
+        control_successes, control_sample_size, critical_value
+    )
+    return (candidate_rate - control_rate) - math.hypot(
+        candidate_rate - candidate_lower,
+        control_upper - control_rate,
+    )
+
+
+def _evaluate_experiment_look(
+    experiment: dict[str, Any], family: dict[str, Any],
+    observations: list[dict[str, Any]], look: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    control = _experiment_arm_stats(
+        observations, experiment["control_variant"]
+    )
+    candidate = _experiment_arm_stats(
+        observations, experiment["candidate_variant"]
+    )
+    primary_candidate, primary_n_candidate = _metric_counts(
+        candidate, experiment["primary_kpi"]
+    )
+    primary_control, primary_n_control = _metric_counts(
+        control, experiment["primary_kpi"]
+    )
+    guard_candidate, guard_n_candidate = _metric_counts(
+        candidate, experiment["guardrail_kpi"]
+    )
+    guard_control, guard_n_control = _metric_counts(
+        control, experiment["guardrail_kpi"]
+    )
+    primary_z, primary_delta = _two_proportion_z(
+        primary_candidate, primary_n_candidate,
+        primary_control, primary_n_control,
+    )
+    guardrail_delta = guard_candidate / guard_n_candidate - guard_control / guard_n_control
+    alpha = float(family["alpha_per_hypothesis_per_look"])
+    primary_critical = statistics.NormalDist().inv_cdf(1 - alpha / 2)
+    guardrail_critical = statistics.NormalDist().inv_cdf(1 - alpha)
+    guardrail_lower = _newcombe_wilson_lower_bound(
+        guard_candidate,
+        guard_n_candidate,
+        guard_control,
+        guard_n_control,
+        guardrail_critical,
+    )
+    margin = float(experiment["guardrail_margin"])
+    primary_significant = primary_z >= primary_critical
+    practical = primary_delta >= float(experiment["practical_effect"])
+    guardrail_safe = guardrail_lower > -margin
+    if primary_significant and practical and guardrail_safe:
+        outcome = "beneficial"
+    elif int(look["look_number"]) == int(family["look_count"]):
+        outcome = "guardrail_blocked" if not guardrail_safe else "inconclusive"
+    else:
+        outcome = "continue"
+    result = {
+        "experiment_id": experiment["experiment_id"],
+        "look_number": int(look["look_number"]),
+        "cutoff_event_id": int(look["cutoff_event_id"]),
+        "alpha_per_hypothesis_per_look": alpha,
+        "primary_kpi": experiment["primary_kpi"],
+        "primary_z": primary_z,
+        "primary_critical_value": primary_critical,
+        "primary_delta": primary_delta,
+        "practical_effect": float(experiment["practical_effect"]),
+        "primary_significant": primary_significant,
+        "practical_effect_met": practical,
+        "control": {
+            "variant": experiment["control_variant"],
+            "successes": primary_control,
+            "sample_size": primary_n_control,
+            "rate": primary_control / primary_n_control,
+        },
+        "candidate": {
+            "variant": experiment["candidate_variant"],
+            "successes": primary_candidate,
+            "sample_size": primary_n_candidate,
+            "rate": primary_candidate / primary_n_candidate,
+        },
+        "guardrail": {
+            "kpi": experiment["guardrail_kpi"],
+            "margin": margin,
+            "candidate_minus_control": guardrail_delta,
+            "lower_confidence_bound_method": "Newcombe-Wilson hybrid score",
+            "confidence_level": 1 - alpha,
+            "critical_value": guardrail_critical,
+            "lower_confidence_bound": guardrail_lower,
+            "safe": guardrail_safe,
+            "control_sample_size": guard_n_control,
+            "candidate_sample_size": guard_n_candidate,
+        },
+        "outcome": outcome,
+    }
+    return outcome, result
+
+
 class Controller:
     def __init__(self, url: str, db_path: str, store: Store | None = None):
         self.client = SimClient(url)
         self.store = store if store is not None else Store(db_path)
         self._workflow_specs: dict[str, dict[str, Any]] = {}
+        self._experiment_registration_skips: set[str] = set()
 
     async def _db(self, method, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(method, *args, **kwargs)
@@ -1096,20 +1500,52 @@ class Controller:
                 w["workflow_id"]: w for w in await self.client.request("GET", "/workflows")
             }
             await self._ingest_available()
+            await self._register_eligible_experiment_plans()
+            await self._evaluate_registered_experiments(state)
             await self._reconcile(state["ts"], plan=not state["finished"])
+            no_progress_advances = 0
             while not state["finished"]:
                 await self._ingest_available()
                 state = await self.client.request("GET", "/sim/state")
+                await self._register_eligible_experiment_plans()
+                await self._evaluate_registered_experiments(state)
                 await self._reconcile(state["ts"], plan=not state["finished"])
                 if state["finished"]:
                     break
+                previous_minute = int(state["sim_minute"])
                 try:
-                    state = await self.client.advance(60)
+                    await self.client.advance(60)
                 except RemoteError as exc:
                     if exc.status == 409 and exc.code == "finished":
+                        state = await self.client.request("GET", "/sim/state")
+                        if not state["finished"]:
+                            raise
                         break
                     raise
+                state = await self.client.request("GET", "/sim/state")
+                current_minute = int(state["sim_minute"])
+                if current_minute < previous_minute:
+                    raise RuntimeError(
+                        "simulator clock moved backwards: "
+                        f"{previous_minute} -> {current_minute} "
+                        f"({state['ts']})"
+                    )
+                if state["finished"]:
+                    break
+                if current_minute == previous_minute:
+                    no_progress_advances += 1
+                    if no_progress_advances >= MAX_CONSECUTIVE_NO_PROGRESS_ADVANCES:
+                        raise RuntimeError(
+                            "simulator made no progress after "
+                            f"{no_progress_advances} consecutive advances; "
+                            f"last simulator time is {state['ts']} "
+                            f"(sim_minute={current_minute})"
+                        )
+                else:
+                    no_progress_advances = 0
             await self._ingest_available()
+            await self._register_eligible_experiment_plans()
+            await self._evaluate_registered_experiments(state)
             await self._reconcile(state["ts"], plan=False)
             LOG.info("scenario finished at %s", state["ts"])
         finally:
@@ -1126,12 +1562,342 @@ class Controller:
                 await self._db(self.store.process_chunk, chunk, raw)
                 after = max(after, int(chunk["chunk"]))
 
+    async def _register_eligible_experiment_plans(self) -> None:
+        proposals = await self._db(self.store.proposals)
+        experiments = await self._db(self.store.experiments)
+        registered_proposals = {
+            experiment["proposal_id"]
+            for experiment in experiments
+            if experiment["proposal_id"] is not None
+        }
+        for proposal in proposals:
+            proposal_id = proposal["proposal_id"]
+            if (
+                proposal["status"] != "applied"
+                or proposal["kind"] not in ("approval", "auto")
+                or proposal_id in registered_proposals
+                or proposal_id in self._experiment_registration_skips
+            ):
+                continue
+            payload = json.loads(proposal["payload"])
+            if not str(payload.get("rationale", "")).startswith(
+                "Start two-arm "
+            ):
+                continue
+            self._experiment_registration_skips.add(proposal_id)
+            LOG.warning(
+                "Skipping fixed-horizon experiment registration for applied "
+                "proposal %s (workflow %s): no compatible pre-treatment, "
+                "person-level baseline exists in the Controller store for the "
+                "experiment's configuration version and cohort; daily arm "
+                "aggregates cannot supply that baseline or determine valid "
+                "sample targets, the documented workflow response does not "
+                "define a guardrail deterioration margin, and no experiment-"
+                "family membership was persisted for this proposal. No "
+                "experiment plan was created.",
+                proposal_id,
+                proposal["workflow_id"],
+            )
+
+    async def _evaluate_registered_experiments(
+        self, simulator_state: dict[str, Any]
+    ) -> None:
+        running = await self._db(self.store.experiments, "running")
+        for experiment in running:
+            family = await self._db(
+                self.store.experiment_family, experiment["family_id"]
+            )
+            if family is None:
+                raise RuntimeError(
+                    f"missing family {experiment['family_id']} for "
+                    f"experiment {experiment['experiment_id']}"
+                )
+            primary_minimum = (
+                MIN_REGISTERED_TARGET_ARM_DIALS
+                if experiment["primary_kpi"] == "pickup_rate"
+                else MIN_REGISTERED_TARGET_ARM_CONNECTED
+            )
+            guardrail_minimum = (
+                MIN_REGISTERED_TARGET_ARM_DIALS
+                if experiment["guardrail_kpi"] == "pickup_rate"
+                else MIN_REGISTERED_TARGET_ARM_CONNECTED
+            )
+            plan_error = None
+            if (
+                experiment["target_primary_n"] is None
+                or experiment["target_guardrail_n"] is None
+            ):
+                plan_error = "fixed sample targets were not registered"
+            elif (
+                int(experiment["target_primary_n"]) < primary_minimum
+                or int(experiment["target_guardrail_n"]) < guardrail_minimum
+            ):
+                plan_error = "registered sample targets are below metric minimums"
+            elif (
+                experiment["baseline_primary"] is None
+                or experiment["baseline_guardrail"] is None
+                or not 0 <= float(experiment["baseline_primary"]) <= 1
+                or not 0 <= float(experiment["baseline_guardrail"]) <= 1
+            ):
+                plan_error = "valid historical baseline rates were not registered"
+            elif experiment["guardrail_margin"] is None:
+                plan_error = "guardrail deterioration margin was not registered"
+
+            if plan_error is not None:
+                if simulator_state["finished"]:
+                    await self._db(
+                        self.store.mark_experiment_underpowered,
+                        experiment["experiment_id"],
+                        int(simulator_state["last_event_id"]),
+                        simulator_state["ts"],
+                        plan_error,
+                        {"target_primary_n": experiment["target_primary_n"],
+                         "target_guardrail_n": experiment["target_guardrail_n"]},
+                    )
+                continue
+
+            observations = await self._db(
+                self.store.experiment_observations, experiment["experiment_id"]
+            )
+            looks = await self._db(
+                self.store.experiment_looks, experiment["experiment_id"]
+            )
+            for look in looks:
+                if look["status"] == "evaluated":
+                    if json.loads(look["result_json"]).get("outcome") == "beneficial":
+                        break
+                    continue
+                if look["status"] not in ("planned", "ready"):
+                    continue
+                if look["cutoff_event_id"] is None:
+                    cutoff = _planned_look_cutoff(
+                        observations, experiment, float(look["information_fraction"])
+                    )
+                    if cutoff is None:
+                        if simulator_state["finished"]:
+                            await self._db(
+                                self.store.mark_experiment_underpowered,
+                                experiment["experiment_id"],
+                                int(simulator_state["last_event_id"]),
+                                simulator_state["ts"],
+                                "registered sample target was not reached by the "
+                                "simulator horizon",
+                                {"target_primary_n": experiment["target_primary_n"],
+                                 "target_guardrail_n": experiment["target_guardrail_n"],
+                                 "observed_people": len(observations)},
+                            )
+                        break
+                    await self._db(
+                        self.store.set_experiment_look_cutoff,
+                        experiment["experiment_id"],
+                        int(look["look_number"]),
+                        cutoff,
+                    )
+                    looks = await self._db(
+                        self.store.experiment_looks, experiment["experiment_id"]
+                    )
+                    look = next(
+                        item for item in looks
+                        if item["look_number"] == look["look_number"]
+                    )
+                scoped = await self._db(
+                    self.store.experiment_observations,
+                    experiment["experiment_id"],
+                    look_number=int(look["look_number"]),
+                )
+                outcome, result = _evaluate_experiment_look(
+                    experiment, family, scoped, look
+                )
+                finalized = await self._db(
+                    self.store.finalize_experiment_look,
+                    experiment["experiment_id"],
+                    int(look["look_number"]),
+                    outcome,
+                    result,
+                    simulator_state["ts"],
+                )
+                if finalized and outcome in (
+                    "beneficial", "inconclusive", "guardrail_blocked"
+                ):
+                    break
+                if not finalized:
+                    break
+
+        for experiment in await self._db(self.store.experiments, "beneficial"):
+            await self._submit_experiment_promotion(experiment, simulator_state["ts"])
+
+    async def _submit_experiment_promotion(
+        self, experiment: dict[str, Any], ts: str
+    ) -> None:
+        spec = self._workflow_specs.get(experiment["workflow_id"])
+        if spec is None:
+            return
+        looks = await self._db(
+            self.store.experiment_looks, experiment["experiment_id"]
+        )
+        successful_look = next(
+            (
+                look for look in reversed(looks)
+                if look["status"] == "evaluated"
+                and json.loads(look["result_json"]).get("outcome") == "beneficial"
+            ),
+            None,
+        )
+        if successful_look is None:
+            raise RuntimeError(
+                f"beneficial experiment {experiment['experiment_id']} "
+                "has no persisted beneficial look"
+            )
+        result = json.loads(successful_look["result_json"])
+        current = await self.client.request(
+            "GET", f"/workflows/{experiment['workflow_id']}/config"
+        )
+        if int(current["version"]) != int(experiment["config_version"]):
+            return
+        revised = {
+            key: value for key, value in current["config"].items()
+        }
+        revised["allocations"] = {
+            cohort: dict(dimensions)
+            for cohort, dimensions in current["config"]["allocations"].items()
+        }
+        population = revised["allocations"].get(experiment["cohort_id"])
+        if population is None or experiment["dimension"] not in population:
+            return
+        allocation = population[experiment["dimension"]]
+        frozen_pair = {
+            experiment["control_variant"], experiment["candidate_variant"]
+        }
+        if set(allocation) != frozen_pair:
+            return
+        population[experiment["dimension"]] = {
+            experiment["candidate_variant"]: 0.8,
+            experiment["control_variant"]: 0.2,
+        }
+        revised["_evidence"] = {
+            "registered_experiment": result,
+            "family_id": experiment["family_id"],
+            "workflow_id": experiment["workflow_id"],
+            "cohort_id": experiment["cohort_id"],
+            "config_version": experiment["config_version"],
+        }
+        reason = (
+            f"Promote {experiment['candidate_variant']} after planned "
+            f"look {successful_look['look_number']} passed the registered "
+            f"{experiment['primary_kpi']} and guardrail criteria."
+        )
+        await self._submit_change(
+            experiment["workflow_id"], spec, current, revised, reason, ts,
+            proposal_id_salt=f"experiment:{experiment['experiment_id']}",
+        )
+
+    async def _record_applied_proposal(
+        self, proposal_id: str, approval_id: str | None, ts: str,
+        action: str, detail: dict[str, Any], payload: dict[str, Any],
+    ) -> bool:
+        rationale = str(payload.get("rationale", ""))
+        spec = self._workflow_specs.get(detail.get("workflow_id", ""))
+        if spec is None:
+            proposal = await self._db(self.store.proposal, proposal_id)
+            spec = self._workflow_specs.get(
+                proposal["workflow_id"] if proposal else "", {}
+            )
+        primary_kpi = (
+            spec.get("objective", {}).get("primary")
+            if rationale.startswith("Promote ")
+            else None
+        )
+        return await self._db(
+            self.store.finalize_applied_proposal,
+            proposal_id,
+            approval_id,
+            ts,
+            action,
+            detail,
+            advance_cursor=rationale.startswith("Promote "),
+            primary_kpi=primary_kpi,
+        )
+
     async def _reconcile(self, ts: str, *, plan: bool = True) -> None:
+        proposals = await self._db(self.store.proposals)
+        for proposal in proposals:
+            if proposal["status"] != "applied":
+                continue
+            payload = json.loads(proposal["payload"])
+            has_audit = await self._db(
+                self.store.has_application_audit, proposal["proposal_id"]
+            )
+            advancement = await self._db(
+                self.store.proposal_cursor_advancement,
+                proposal["proposal_id"],
+            )
+            rationale = str(payload.get("rationale", ""))
+            spec = self._workflow_specs.get(proposal["workflow_id"], {})
+            primary_kpi = spec.get("objective", {}).get("primary")
+            if has_audit:
+                if (
+                    rationale.startswith("Promote ")
+                    and primary_kpi == "engagement_rate"
+                    and advancement is None
+                ):
+                    await self._record_applied_proposal(
+                        proposal["proposal_id"],
+                        proposal.get("approval_id"),
+                        ts,
+                        "approval_applied_reconciled",
+                        {"proposal_id": proposal["proposal_id"],
+                         "workflow_id": proposal["workflow_id"],
+                         "rationale": rationale},
+                        payload,
+                    )
+                elif advancement == "legacy_unverified":
+                    LOG.warning(
+                        "Applied legacy proposal %s has an ambiguous "
+                        "cursor history; audit presence does not establish "
+                        "whether its cursor advancement occurred",
+                        proposal["proposal_id"],
+                    )
+                continue
+            if proposal["kind"] == "auto":
+                await self._reconcile_auto(proposal, payload, ts)
+                continue
+            history = await self.client.request(
+                "GET",
+                f"/workflows/{proposal['workflow_id']}/config/history",
+            )
+            applied = next(
+                (
+                    item for item in history
+                    if item.get("proposal_id") == proposal["proposal_id"]
+                    and int(item["version"]) > int(proposal["base_version"])
+                ),
+                None,
+            )
+            if applied is not None:
+                aid = applied.get("approval_id") or proposal.get("approval_id")
+                await self._start_experiment_for_proposal(
+                    proposal["proposal_id"]
+                )
+                await self._record_applied_proposal(
+                    proposal["proposal_id"],
+                    aid,
+                    applied.get("applied_at") or ts,
+                    "approval_applied_reconciled",
+                    {"approval_id": aid,
+                     "proposal_id": proposal["proposal_id"],
+                     "version": applied["version"],
+                     "actor": applied.get("actor"),
+                     "rationale": payload.get("rationale")},
+                    payload,
+                )
+
         approvals = await self.client.request("GET", "/approvals")
         approvals_by_pid = {item["proposal_id"]: item for item in approvals}
-        for proposal in await self._db(self.store.proposals):
+        for proposal in proposals:
+            if proposal["status"] == "applied":
+                continue
             if proposal["status"] in (
-                "applied", "rejected", "expired", "lapsed", "conflict", "not_permitted"
+                "rejected", "expired", "lapsed", "conflict", "not_permitted"
             ):
                 continue
             payload = json.loads(proposal["payload"])
@@ -1260,18 +2026,15 @@ class Controller:
                     )
                     continue
                 await self._start_experiment_for_proposal(proposal["proposal_id"])
-                transitioned = await self._db(
-                    self.store.mark_approval_applied,
+                await self._record_applied_proposal(
                     proposal["proposal_id"], aid, ts,
                     "approval_applied_reconciled",
                     {"approval_id": aid, "proposal_id": proposal["proposal_id"],
                      "version": applied["version"], "actor": applied["actor"],
-                     "rationale": payload.get("rationale")},
+                     "rationale": payload.get("rationale"),
+                     "workflow_id": proposal["workflow_id"]},
+                    payload,
                 )
-                if transitioned:
-                    await self._advance_experiment_cursor(
-                        proposal["workflow_id"], payload
-                    )
                 continue
             if status == "approved":
                 cfg = await self.client.request(
@@ -1304,11 +2067,12 @@ class Controller:
                     await self._start_experiment_for_proposal(
                         proposal["proposal_id"]
                     )
-                    transitioned = await self._db(
-                        self.store.mark_approval_applied,
+                    await self._record_applied_proposal(
                         proposal["proposal_id"], aid, ts, "approval_applied",
                         {"approval_id": aid, "proposal_id": proposal["proposal_id"],
-                         "result": result, "rationale": payload.get("rationale")},
+                         "result": result, "rationale": payload.get("rationale"),
+                         "workflow_id": proposal["workflow_id"]},
+                        payload,
                     )
                 except RemoteError as exc:
                     if exc.status == 410:
@@ -1317,25 +2081,20 @@ class Controller:
                         status = "conflict"
                     else:
                         raise
-                if status == "applied" and transitioned:
-                    await self._advance_experiment_cursor(proposal["workflow_id"], payload)
                 if status == "applied":
                     continue
             elif status == "applied":
                 await self._start_experiment_for_proposal(
                     proposal["proposal_id"]
                 )
-                transitioned = await self._db(
-                    self.store.mark_approval_applied,
+                await self._record_applied_proposal(
                     proposal["proposal_id"], aid, ts,
                     "approval_applied_reconciled",
                     {"approval_id": aid, "proposal_id": proposal["proposal_id"],
-                     "rationale": payload.get("rationale")},
+                     "rationale": payload.get("rationale"),
+                     "workflow_id": proposal["workflow_id"]},
+                    payload,
                 )
-                if transitioned:
-                    await self._advance_experiment_cursor(
-                        proposal["workflow_id"], payload
-                    )
                 continue
             terminal_audit = None
             if status in ("rejected", "expired", "lapsed"):
@@ -1373,16 +2132,17 @@ class Controller:
         )
         if applied:
             await self._start_experiment_for_proposal(proposal["proposal_id"])
-            await self._db(self.store.save_proposal,
-                proposal["proposal_id"], proposal["workflow_id"],
-                proposal["base_version"], "auto", "applied", payload,
+            await self._record_applied_proposal(
+                proposal["proposal_id"],
+                None,
+                applied.get("applied_at") or ts,
+                "auto_applied",
+                {"proposal_id": proposal["proposal_id"],
+                 "version": applied["version"],
+                 "rationale": payload.get("rationale"),
+                 "workflow_id": proposal["workflow_id"]},
+                payload,
             )
-            await self._db(self.store.audit,
-                applied.get("applied_at") or ts, proposal["workflow_id"], "auto_applied",
-                {"proposal_id": proposal["proposal_id"], "version": applied["version"],
-                 "rationale": payload.get("rationale")},
-            )
-            await self._advance_experiment_cursor(proposal["workflow_id"], payload)
             return
         current = await self.client.request(
             "GET", f"/workflows/{proposal['workflow_id']}/config"
@@ -1439,16 +2199,16 @@ class Controller:
             else:
                 raise
         await self._start_experiment_for_proposal(proposal["proposal_id"])
-        await self._db(self.store.save_proposal,
-            proposal["proposal_id"], proposal["workflow_id"],
-            proposal["base_version"], "auto", "applied", payload,
-        )
-        await self._db(self.store.audit,
-            ts, proposal["workflow_id"], "auto_applied",
+        await self._record_applied_proposal(
+            proposal["proposal_id"],
+            None,
+            ts,
+            "auto_applied",
             {"proposal_id": proposal["proposal_id"], "result": result,
-             "rationale": payload.get("rationale")},
+             "rationale": payload.get("rationale"),
+             "workflow_id": proposal["workflow_id"]},
+            payload,
         )
-        await self._advance_experiment_cursor(proposal["workflow_id"], payload)
 
     async def _start_experiment_for_proposal(self, proposal_id: str) -> None:
         experiment_id = await self._db(
@@ -1480,20 +2240,6 @@ class Controller:
             raise RuntimeError(
                 f"experiment {experiment_id} did not reach a terminal startup state"
             )
-
-    async def _advance_experiment_cursor(
-        self, workflow_id: str, payload: dict[str, Any]
-    ) -> None:
-        if not str(payload.get("rationale", "")).startswith("Promote "):
-            return
-        spec = self._workflow_specs[workflow_id]
-        if spec["objective"]["primary"] != "engagement_rate":
-            return
-        current = await self._db(
-            self.store.experiment_dimension, workflow_id, "welcome_message"
-        )
-        next_dim = "voice" if current == "welcome_message" else "welcome_message"
-        await self._db(self.store.set_experiment_dimension, workflow_id, next_dim)
 
     async def _detect_and_plan(
         self, wid: str, spec: dict[str, Any], current: dict[str, Any], ts: str
@@ -1647,92 +2393,7 @@ class Controller:
             revised["allocations"]["default"] = dict(cfg["allocations"]["default"])
             revised["allocations"]["default"][dim] = {incumbent: 0.5, candidate: 0.5}
             return revised, f"Start two-arm {dim} exploration ({incumbent}, {candidate}) for {primary}."
-        choices = sorted(positive)
-        if len(choices) > 2:
-            choices = sorted(choices, key=lambda value: stats[value].dials, reverse=True)[:2]
-        a, b = stats[choices[0]], stats[choices[1]]
-        comparison = _proportion_z(a, b, primary)
-        if comparison is None:
-            return None
-        z, delta = comparison
-        winner, loser = (choices[0], choices[1]) if z > 0 else (choices[1], choices[0])
-        # The other KPI is a guardrail, checked on the same randomized arms.
-        guardrail = "engagement_rate" if primary == "pickup_rate" else "pickup_rate"
-        g = _proportion_z(stats[winner], stats[loser], guardrail)
-        if g is None:
-            return None
-        if await self._db(self.store.experiment_evaluated, wid, version):
-            return None
-        await self._db(self.store.mark_experiment_evaluated, wid, version)
-        if abs(z) < CONFIDENCE_Z or abs(delta) < 0.015:
-            return None
-        gz, gd = g
-        max_drop = float(spec["objective"]["guardrail"].get(
-            f"{guardrail}_max_drop", 0.02
-        ))
-        if gd < -max_drop or (abs(gz) >= 1.96 and gd < 0):
-            return None
-        revised = dict(cfg)
-        revised["allocations"] = {k: dict(v) for k, v in cfg["allocations"].items()}
-        revised["allocations"]["default"] = dict(cfg["allocations"]["default"])
-        revised["allocations"]["default"][dim] = {winner: 0.8, loser: 0.2}
-        def metric_counts(arm: ArmStats) -> tuple[int, int]:
-            if primary == "pickup_rate":
-                return arm.connected, arm.dials
-            return arm.engaged, arm.connected
-
-        control_successes, control_sample = metric_counts(stats[loser])
-        candidate_successes, candidate_sample = metric_counts(stats[winner])
-        control_rate = control_successes / control_sample
-        candidate_rate = candidate_successes / candidate_sample
-        winner_minus_loser = candidate_rate - control_rate
-        guardrail_control_successes, guardrail_control_sample = (
-            (stats[loser].connected, stats[loser].dials)
-            if guardrail == "pickup_rate"
-            else (stats[loser].engaged, stats[loser].connected)
-        )
-        guardrail_candidate_successes, guardrail_candidate_sample = (
-            (stats[winner].connected, stats[winner].dials)
-            if guardrail == "pickup_rate"
-            else (stats[winner].engaged, stats[winner].connected)
-        )
-        revised["_evidence"] = {
-            "workflow_id": wid,
-            "cohort_id": cohort,
-            "dimension": dim,
-            "config_version": version,
-            "primary_kpi": primary,
-            "control": {
-                "variant": loser,
-                "rate": control_rate,
-                "sample_size": control_sample,
-            },
-            "candidate": {
-                "variant": winner,
-                "rate": candidate_rate,
-                "sample_size": candidate_sample,
-            },
-            "absolute_lift": abs(candidate_rate - control_rate),
-            "statistical_test": {
-                "name": "two_proportion_z",
-                "z_score": abs(z),
-                "effect_delta": candidate_rate - control_rate,
-                "winner_minus_loser": winner_minus_loser,
-            },
-            "guardrail": {
-                "kpi": guardrail,
-                "control_rate": guardrail_control_successes / guardrail_control_sample,
-                "candidate_rate": guardrail_candidate_successes / guardrail_candidate_sample,
-                "control_sample_size": guardrail_control_sample,
-                "candidate_sample_size": guardrail_candidate_sample,
-                "z_score": gz,
-                "effect_delta": gd,
-            },
-        }
-        return revised, (
-            f"Promote {winner} to 80% after a two-arm test: {primary} delta "
-            f"{winner_minus_loser:+.3f}, z={z:.2f}; retain 20% exploration."
-        )
+        return None
 
     async def _prompt_change(
         self, wid: str, spec: dict[str, Any], cfg: dict[str, Any], ts: str
@@ -1827,7 +2488,8 @@ class Controller:
 
     async def _submit_change(
         self, wid: str, spec: dict[str, Any], current: dict[str, Any],
-        revised: dict[str, Any], reason: str, ts: str,
+        revised: dict[str, Any], reason: str, ts: str, *,
+        proposal_id_salt: str | None = None,
     ) -> None:
         revised = dict(revised)
         evidence = revised.pop("_evidence", None)
@@ -1835,7 +2497,10 @@ class Controller:
         delta = _diff(current["config"], revised)
         if not delta:
             return
-        proposal_id = _stable_id("proposal", wid, version, revised, ts[:10])
+        proposal_id = _stable_id(
+            "proposal", wid, version, revised,
+            proposal_id_salt or ts[:10],
+        )
         existing = await self._db(self.store.proposal, proposal_id)
         if existing:
             return
